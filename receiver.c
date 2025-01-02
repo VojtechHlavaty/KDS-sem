@@ -1,3 +1,4 @@
+
 #include <sys/socket.h>
 #include <zlib.h>
 #include <openssl/md5.h>
@@ -7,15 +8,12 @@
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <stdbool.h>
-#include <errno.h>
+#include <time.h>
 
 #define PACKET_MAX_LEN 1024
 #define PACKET_MAX_SIZE (1024 - 2 * sizeof(uint32_t) - sizeof(bool) - sizeof(uint16_t))
-#define SERVER_PORT 12345
-#define SUCCESS 0
-#define RECEIVE_ERROR 201
-#define FILE_ERROR 202
-#define HASH_ERROR 203
+#define RECEIVER_PORT 15001
+#define SENDER_PORT 14000
 
 typedef struct {
     uint32_t packet_number;
@@ -25,17 +23,27 @@ typedef struct {
     uint32_t crc;
 } Packet;
 
-static int sockfd;
-static struct sockaddr_in server_addr, client_addr;
-static socklen_t client_len;
+static int data_sockfd, ack_sockfd;
+static struct sockaddr_in client_addr;
+static socklen_t client_len = sizeof(client_addr);
+float corruption_probability = 0.0; // 10% chance of corruption
+float loss_probability = 0.0;       // 10% chance of packet loss
+
+void introduce_bit_error(Packet *packet) {
+    if ((float)rand() / RAND_MAX < corruption_probability) {
+        size_t byte_to_corrupt = rand() % packet->data_size;
+        packet->data[byte_to_corrupt] ^= 1 << (rand() % 8); // Flip a random bit
+        printf("Simulated bit error in packet %u\n", packet->packet_number);
+    }
+}
 
 int calculate_md5(const char *filename, unsigned char *hash) {
     FILE *file = fopen(filename, "rb");
     if (!file) {
         perror("Error opening file for MD5 calculation");
-        return FILE_ERROR;
+        return -1;
     }
- 
+
     MD5_CTX md5_ctx;
     MD5_Init(&md5_ctx);
 
@@ -45,178 +53,123 @@ int calculate_md5(const char *filename, unsigned char *hash) {
         MD5_Update(&md5_ctx, buffer, bytes_read);
     }
 
-    if (ferror(file)) {
-        perror("Error reading file for MD5 calculation");
-        fclose(file);
-        return FILE_ERROR;
-    }
-
-    MD5_Final(hash, &md5_ctx);
     fclose(file);
-    return SUCCESS;
+    MD5_Final(hash, &md5_ctx);
+    return 0;
 }
 
-int init_socket() {
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
+int init_sockets() {
+    data_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (data_sockfd < 0) {
         perror("Socket creation failed");
         return -1;
     }
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(SERVER_PORT);
-
-    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(sockfd);
+    struct sockaddr_in receiver_addr;
+    memset(&receiver_addr, 0, sizeof(receiver_addr));
+    receiver_addr.sin_family = AF_INET;
+    receiver_addr.sin_addr.s_addr = INADDR_ANY;
+    receiver_addr.sin_port = htons(RECEIVER_PORT);
+    if (bind(data_sockfd, (struct sockaddr *)&receiver_addr, sizeof(receiver_addr)) < 0) {
+        perror("Receiver socket bind failed");
         return -1;
     }
 
-    return SUCCESS;
+    return 0;
 }
 
 int send_ack() {
-    if (sendto(sockfd, "ACK", 3, 0, (struct sockaddr *)&client_addr, client_len) < 0) {
+    client_addr.sin_port = htons(SENDER_PORT);
+    if (sendto(data_sockfd, "ACK", 3, 0, (struct sockaddr *)&client_addr, client_len) < 0) {
         perror("Failed to send ACK");
         return -1;
     }
-    return SUCCESS;
+    printf("Sent ACK\n");
+    return 0;
+}
+
+int send_nack() {
+    if (sendto(data_sockfd, "NACK", 4, 0, (struct sockaddr *)&client_addr, client_len) < 0) {
+        perror("Failed to send NACK");
+        return -1;
+    }
+    printf("Sent NACK\n");
+    return 0;
 }
 
 int receive_packet(Packet *packet) {
-    ssize_t received = recvfrom(sockfd, packet, sizeof(*packet), 0,
-                               (struct sockaddr *)&client_addr, &client_len);
-    if (received < 0) {
-        perror("Error receiving packet");
-        return RECEIVE_ERROR;
-    }
-
-    // Validate CRC
-    uint32_t calculated_crc = crc32(0L, (const Bytef *)&packet->packet_number, 
-    sizeof(packet->packet_number) + 
-    sizeof(packet->termination) + 
-    packet->data_size);
-    if (calculated_crc != packet->crc) {
-        fprintf(stderr, "CRC mismatch in packet %u. Dropping packet.\n", packet->packet_number);
-        return RECEIVE_ERROR;
-    }
-
-    return SUCCESS;
-}
-
-int receive_filename(char *filename, size_t filename_size) {
-    Packet packet;
-    int result = receive_packet(&packet);
-    if (result != SUCCESS) return result;
-
-    if (packet.packet_number != 0) {
-        fprintf(stderr, "Expected filename packet, got packet number %u\n", packet.packet_number);
-        return RECEIVE_ERROR;
-    }
-
-    strncpy(filename, packet.data, filename_size - 1);
-    filename[filename_size - 1] = '\0';
-    printf("Receiving file: %s\n", filename);
-    return send_ack();
-}
-
-int receive_md5_hash(unsigned char *received_md5) {
-    Packet packet;
-    int result = receive_packet(&packet);
-    if (result != SUCCESS) return result;
-
-    if (packet.packet_number != 1) {
-        fprintf(stderr, "Expected MD5 hash packet, got packet number %u\n", packet.packet_number);
-        return RECEIVE_ERROR;
-    }
-
-    memcpy(received_md5, packet.data, MD5_DIGEST_LENGTH);
-    return send_ack();
-}
-
-int receive_file_data(FILE *file, uint32_t expected_packet) {
-    Packet packet;
     while (1) {
-        int result = receive_packet(&packet);
-        if (result != SUCCESS) return result;
+        ssize_t received = recvfrom(data_sockfd, packet, sizeof(*packet), 0,
+                                    (struct sockaddr *)&client_addr, &client_len);
+        if (received < 0) {
+            perror("Error receiving packet");
+            return -1;
+        }
 
-        printf("Received packet %u, packet size %u bytes, termination: %u\n", 
-               packet.packet_number, packet.data_size, packet.termination);
+        introduce_bit_error(packet);
 
-        if (packet.packet_number != expected_packet) {
-            printf("Expected packet %u, got %u. Requesting retransmission.\n",
-                   expected_packet, packet.packet_number);
+        if ((float)rand() / RAND_MAX < loss_probability) {
+            printf("Simulating packet loss for PACKET %u\n", packet->packet_number);
+            continue; // Pretend this packet was lost
+        }
+
+        uint32_t calculated_crc = crc32(0L, (const Bytef *)&packet->packet_number,
+                                        sizeof(packet->packet_number) +
+                                        sizeof(packet->termination) +
+                                        packet->data_size);
+        if (calculated_crc != packet->crc) {
+            fprintf(stderr, "CRC mismatch for packet %u\n", packet->packet_number);
+            if (send_nack() < 0) return -1;
             continue;
         }
 
-        // Write data to file regardless of termination flag
-        if (fwrite(packet.data, 1, packet.data_size, file) != packet.data_size) {
-            perror("Error writing to file");
-            return FILE_ERROR;
-        }
-        fflush(file);
-
         send_ack();
-        expected_packet++;
-
-        // Handle termination after writing data
-        if (packet.termination) {
-            printf("Received termination packet.\n");
-            break;
-        }
+        return 0;
     }
-    return SUCCESS;
-}
-
-int verify_file_hash(const char *filename, const unsigned char *received_md5) {
-    unsigned char calculated_md5[MD5_DIGEST_LENGTH];
-    int result = calculate_md5(filename, calculated_md5);
-    if (result != SUCCESS) return result;
-
-    if (memcmp(received_md5, calculated_md5, MD5_DIGEST_LENGTH) != 0) {
-        fprintf(stderr, "MD5 hash mismatch\n");
-        return HASH_ERROR;
-    }
-
-    printf("File received successfully with matching MD5 hash.\n");
-    return SUCCESS;
-}
-
-int receive_file() {
-    client_len = sizeof(client_addr);
-    char filename[256];
-    unsigned char received_md5[MD5_DIGEST_LENGTH];
-    uint32_t expected_packet = 2;
-    int result;
-
-    if ((result = receive_filename(filename, sizeof(filename))) != SUCCESS) return result;
-    if ((result = receive_md5_hash(received_md5)) != SUCCESS) return result;
-
-    FILE *file = fopen(filename, "wb");
-    if (!file) {
-        perror("Error opening file for writing");
-        return FILE_ERROR;
-    }
-
-    result = receive_file_data(file, expected_packet);
-    fclose(file);
-    if (result != SUCCESS) return result;
-
-    return verify_file_hash(filename, received_md5);
 }
 
 int main() {
-    if (init_socket() < 0) {
+    if (init_sockets() < 0) {
         return 1;
     }
 
-    printf("Server started on port %d\n", SERVER_PORT);
-    
-    int result = receive_file();
-    printf("File reception completed with result: %d\n", result);
-    
-    close(sockfd);
-    return result;
+    printf("Receiver started: Data Port %d, ACK Port %d\n", RECEIVER_PORT, SENDER_PORT);
+
+    Packet packet;
+    FILE *file = NULL;
+    char filename[256];
+    unsigned char received_md5[MD5_DIGEST_LENGTH];
+
+    while (1) {
+        if (receive_packet(&packet) == 0) {
+            if (packet.packet_number == 0) {
+                strncpy(filename, packet.data, sizeof(filename) - 1);
+                file = fopen(filename, "wb");
+                printf("Receiving file: %s\n", filename);
+            } else if (packet.packet_number == 1) {
+                memcpy(received_md5, packet.data, MD5_DIGEST_LENGTH);
+                printf("MD5 hash received\n");
+            } else {
+                fwrite(packet.data, 1, packet.data_size, file);
+                if (packet.termination) {
+                    fclose(file);
+                    printf("File received successfully\n");
+                    break;
+                }
+            }
+        }
+    }
+
+    unsigned char calculated_md5[MD5_DIGEST_LENGTH];
+    calculate_md5(filename, calculated_md5);
+
+    if (memcmp(received_md5, calculated_md5, MD5_DIGEST_LENGTH) == 0) {
+        printf("File integrity verified with MD5\n");
+    } else {
+        fprintf(stderr, "MD5 mismatch\n");
+    }
+
+    close(data_sockfd);
+    close(ack_sockfd);
+    return 0;
 }

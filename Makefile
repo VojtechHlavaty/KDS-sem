@@ -40,6 +40,6 @@ $(RECEIVER_OBJ): $(RECEIVER_SRC) | $(OBJ_DIR)
 
 # Clean build files
 clean:
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
+	rm -rf $(OBJ_DIR) $(BIN_DIR) sender
 
 .PHONY: all clean

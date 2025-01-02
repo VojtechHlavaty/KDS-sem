@@ -1,3 +1,4 @@
+
 #include <sys/socket.h>
 #include <zlib.h>
 #include <openssl/md5.h>
@@ -8,17 +9,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdbool.h>
-#include <errno.h>
+#include <sys/time.h>
 
 #define PACKET_MAX_LEN 1024
 #define PACKET_MAX_SIZE (1024 - 2 * sizeof(uint32_t) - sizeof(bool) - sizeof(uint16_t))
-#define SERVER_PORT 12345
-#define SUCCESS 0
-#define FOPEN_ERROR 101
-#define SOCKET_INIT_ERROR 102
-#define SOCKET_SEND_ERROR 103
-#define HASH_ERROR 104
-#define TIMEOUT_SECONDS 2
+#define SENDER_PORT 14000
+#define RECEIVER_PORT 15001 
 
 typedef struct {
     uint32_t packet_number;
@@ -28,21 +24,16 @@ typedef struct {
     uint32_t crc;
 } Packet;
 
-// Function prototypes
-int calculate_md5(const char *filename, unsigned char *hash);
-int init_socket(const char *server_ip, struct sockaddr_in *server_addr);
-int send_packet_with_ack(int sockfd, Packet *packet, struct sockaddr_in *server_addr);
-int send_filename_packet(int sockfd, const char *fname, struct sockaddr_in *server_addr);
-int send_md5_packet(int sockfd, const unsigned char *md5_hash, struct sockaddr_in *server_addr);
-int send_file_data(int sockfd, FILE *file, struct sockaddr_in *server_addr);
+static int data_sockfd, ack_sockfd;
+static struct sockaddr_in receiver_data_addr, receiver_ack_addr;
 
 int calculate_md5(const char *filename, unsigned char *hash) {
     FILE *file = fopen(filename, "rb");
     if (!file) {
         perror("Error opening file for MD5 calculation");
-        return FOPEN_ERROR;
+        return -1;
     }
- 
+
     MD5_CTX md5_ctx;
     MD5_Init(&md5_ctx);
 
@@ -52,194 +43,157 @@ int calculate_md5(const char *filename, unsigned char *hash) {
         MD5_Update(&md5_ctx, buffer, bytes_read);
     }
 
-    if (ferror(file)) {
-        perror("Error reading file for MD5 calculation");
-        fclose(file);
-        return FOPEN_ERROR;
-    }
-
-    MD5_Final(hash, &md5_ctx);
     fclose(file);
-    return SUCCESS;
+    MD5_Final(hash, &md5_ctx);
+    return 0;
 }
 
-int init_socket(const char *server_ip, struct sockaddr_in *server_addr) {
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        perror("Socket initialization failed");
-        return SOCKET_INIT_ERROR;
+int init_sockets(const char *receiver_ip) {
+    data_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (data_sockfd < 0) {
+        perror("Socket creation failed");
+        return -1;
     }
 
-    memset(server_addr, 0, sizeof(*server_addr));
-    server_addr->sin_family = AF_INET;
-    server_addr->sin_port = htons(SERVER_PORT);
-
-    if (inet_pton(AF_INET, server_ip, &server_addr->sin_addr) <= 0) {
-        perror("Invalid server IP address");
-        close(sockfd);
-        return SOCKET_INIT_ERROR;
+    // Bind the sender's socket to SENDER_PORT for receiving ACKs
+    struct sockaddr_in sender_addr;
+    memset(&sender_addr, 0, sizeof(sender_addr));
+    sender_addr.sin_family = AF_INET;
+    sender_addr.sin_addr.s_addr = INADDR_ANY;
+    sender_addr.sin_port = htons(SENDER_PORT);
+    if (bind(data_sockfd, (struct sockaddr *)&sender_addr, sizeof(sender_addr)) < 0) {
+        perror("Sender socket bind failed");
+        return -1;
     }
+
+    // Configure the receiver's address
+    memset(&receiver_data_addr, 0, sizeof(receiver_data_addr));
+    receiver_data_addr.sin_family = AF_INET;
+    receiver_data_addr.sin_port = htons(RECEIVER_PORT);
+    inet_pton(AF_INET, receiver_ip, &receiver_data_addr.sin_addr);
+
+    return 0;
+}
+
+int send_packet(Packet *packet) {
+    packet->crc = crc32(0L, (const Bytef *)&packet->packet_number,
+                        sizeof(packet->packet_number) +
+                        sizeof(packet->termination) +
+                        packet->data_size);
 
     struct timeval timeout;
-    timeout.tv_sec = TIMEOUT_SECONDS;
+    timeout.tv_sec = 1;
     timeout.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    int retries = 5;
 
-    return sockfd;
-}
+    if (setsockopt(data_sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("Failed to set socket timeout");
+        return -1;
+    }
 
-int send_packet_with_ack(int sockfd, Packet *packet, struct sockaddr_in *server_addr) {
-    while (1) {
-        if (sendto(sockfd, packet, sizeof(*packet), 0, (struct sockaddr *)server_addr, sizeof(*server_addr)) < 0) {
-            perror("Failed to send packet");
-            return SOCKET_SEND_ERROR;
-        }
+    while(retries > 0) {
+
+        if (sendto(data_sockfd, packet, sizeof(*packet), 0,
+               (struct sockaddr *)&receiver_data_addr, sizeof(receiver_data_addr)) < 0) {
+        perror("Failed to send packet");
+        return -1;
+        } 
+
+        printf("Sent PACKET %u, PACKET SIZE: %u bytes (TERMINATION: %u)\n", packet->packet_number, packet->data_size, packet->termination);
 
         char ack_buffer[16];
-        ssize_t ack_len = recvfrom(sockfd, ack_buffer, sizeof(ack_buffer), 0, NULL, NULL);
-        if (ack_len > 0 && strncmp(ack_buffer, "ACK", 3) == 0) {
-            return SUCCESS;
+        struct sockaddr_in ack_from;
+        socklen_t ack_len = sizeof(ack_from);
+        ssize_t response_size = recvfrom(data_sockfd, ack_buffer, sizeof(ack_buffer), 0,
+                    (struct sockaddr *)&ack_from, &ack_len);
+
+        if (response_size < 0) {
+            printf("Timeout or error receiving response, remaning retries: %u\n", retries);
+            retries--;
+            continue; // Retry sending the packet
         }
-        printf("Resending packet %d\n", packet->packet_number);
+
+        if (strncmp(ack_buffer, "ACK", 3) == 0) {
+            printf("Received ACK for PACKET %u\n", packet->packet_number);
+            return 0; // Successfully acknowledged
+        } else if (strncmp(ack_buffer, "NACK", 4) == 0) {
+            printf("Received NACK for PACKET %u, resending...\n", packet->packet_number);
+            continue; // Resend the packet
+        } else {
+            printf("Unexpected response: %.*s\n", (int)response_size, ack_buffer);
+        }
     }
+    printf("Failed to send PACKET %u after %u tries, ending\n", packet->packet_number, retries);
+    return -1;
 }
 
-int send_filename_packet(int sockfd, const char *fname, struct sockaddr_in *server_addr) {
+
+int main(int argc, char *argv[]) {
+
+    struct timeval start_time, end_time;
+    size_t total_data_sent = 0;
+    gettimeofday(&start_time, NULL);
+
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <file> <receiver_ip>\n", argv[0]);
+        return 1;
+    }
+
+    const char *filename = argv[1];
+    const char *receiver_ip = argv[2];
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Error opening file");
+        return 1;
+    }
+
+    init_sockets(receiver_ip);
+
+    unsigned char md5_hash[MD5_DIGEST_LENGTH];
+    calculate_md5(filename, md5_hash);
+
     Packet packet = {0};
-    strncpy(packet.data, fname, PACKET_MAX_SIZE - 1);
-    packet.data[PACKET_MAX_SIZE - 1] = '\0';
+    strncpy(packet.data, filename, PACKET_MAX_SIZE - 1);
     packet.packet_number = 0;
-    packet.data_size = strlen(fname) + 1;
-    packet.termination = false;
-    packet.crc = crc32(0L, (const Bytef *)&packet.packet_number, 
-    sizeof(packet.packet_number) + 
-    sizeof(packet.termination) + 
-    packet.data_size);
+    packet.data_size = strlen(filename) + 1;
+    send_packet(&packet);
 
-    int result = send_packet_with_ack(sockfd, &packet, server_addr);
-    if (result == SUCCESS) {
-        printf("File name sent: %s\n", fname);
-    }
-    return result;
-}
-
-int send_md5_packet(int sockfd, const unsigned char *md5_hash, struct sockaddr_in *server_addr) {
-    Packet packet = {0};
-    memcpy(packet.data, md5_hash, MD5_DIGEST_LENGTH);
     packet.packet_number = 1;
+    memcpy(packet.data, md5_hash, MD5_DIGEST_LENGTH);
     packet.data_size = MD5_DIGEST_LENGTH;
-    packet.termination = false;
-    packet.crc = crc32(0L, (const Bytef *)&packet.packet_number, 
-    sizeof(packet.packet_number) + 
-    sizeof(packet.termination) + 
-    packet.data_size);
+    send_packet(&packet);
 
-    int result = send_packet_with_ack(sockfd, &packet, server_addr);
-    if (result == SUCCESS) {
-        printf("MD5 hash sent successfully.\n");
-    }
-    return result;
-}
-
-int send_file_data(int sockfd, FILE *file, struct sockaddr_in *server_addr) {
-    Packet packet = {0};
-    uint32_t packet_number = 2;
     size_t bytes_read;
-
-    while (1) {
-        bytes_read = fread(packet.data, 1, PACKET_MAX_SIZE, file);
+    uint32_t packet_number = 2;
+    while ((bytes_read = fread(packet.data, 1, PACKET_MAX_SIZE, file)) > 0) {
         packet.packet_number = packet_number++;
         packet.data_size = bytes_read;
-        packet.termination = false;
+        packet.termination = feof(file);
 
-        if (bytes_read < PACKET_MAX_SIZE) {
-            if (feof(file)) {
-                packet.termination = true;
-            } else if (ferror(file)) {
-                perror("Error reading file");
-                return FOPEN_ERROR;
-            }
+        if (send_packet(&packet) < 0) {
+            fclose(file);
+            return 1;
         }
 
-        packet.crc = crc32(0L, (const Bytef *)&packet.packet_number, 
-            sizeof(packet.packet_number) +
-            sizeof(packet.termination) +
-            packet.data_size);
-
-        int result = send_packet_with_ack(sockfd, &packet, server_addr);
-        if (result != SUCCESS) {
-            return result;
-        }
-
-        printf("Sent packet %d with %zu bytes%s\n", packet.packet_number, bytes_read,
-               packet.termination ? " (termination)" : "");
+        total_data_sent += sizeof(packet);
 
         if (packet.termination) {
-            printf("Termination packet sent. Ending communication.\n");
+            printf("Final packet sent, terminating sender.\n");
             break;
         }
     }
 
-    return SUCCESS;
-}
+    gettimeofday(&end_time, NULL);
 
-int send_file(const char *fname, const char *server_ip) {
-    printf("File name: %s | Server IP: %s\n", fname, server_ip);
+    double elapsed_time = (end_time.tv_sec - start_time.tv_sec) +
+                          (end_time.tv_usec - start_time.tv_usec) / 1000000.0;
 
-    FILE *file = fopen(fname, "rb");
-    if (!file) {
-        perror("Error opening file");
-        return FOPEN_ERROR;
-    }
+    double transmission_speed = (total_data_sent * 8) / elapsed_time;
 
-    unsigned char md5_hash[MD5_DIGEST_LENGTH];
-    if (calculate_md5(fname, md5_hash) != SUCCESS) {
-        fclose(file);
-        return HASH_ERROR;
-    }
+    printf("Total Data Sent: %zu bytes\n", total_data_sent);
+    printf("Elapsed Time: %.2f seconds\n", elapsed_time);
+    printf("Transmission Speed: %.2f bps\n", transmission_speed);
 
-    struct sockaddr_in server_addr;
-    int sockfd = init_socket(server_ip, &server_addr);
-    if (sockfd < 0) {
-        fclose(file);
-        return sockfd;
-    }
-
-    int result;
-    
-    // Send filename
-    if ((result = send_filename_packet(sockfd, fname, &server_addr)) != SUCCESS) {
-        goto cleanup;
-    }
-
-    // Send MD5 hash
-    if ((result = send_md5_packet(sockfd, md5_hash, &server_addr)) != SUCCESS) {
-        goto cleanup;
-    }
-
-    // Send file data
-    if ((result = send_file_data(sockfd, file, &server_addr)) != SUCCESS) {
-        goto cleanup;
-    }
-
-    printf("File sent successfully.\n");
-
-cleanup:
     fclose(file);
-    close(sockfd);
-    return result;
-}
-
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <file> <server_ip>\n", argv[0]);
-        return 1;
-    }
-
-    const char *fname = argv[1];
-    const char *server_ip = argv[2];
-
-    int ret = send_file(fname, server_ip);
-    printf("Result: %d\n", ret);
-    return ret;
+    return 0;
 }
